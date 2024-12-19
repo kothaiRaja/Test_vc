@@ -442,6 +442,76 @@ process ANNOTATE_VARIANTS {
 }
 
 
+process VCF_TO_TABLE {
+    tag "Convert VCF to Table"
+
+    container 'https://depot.galaxyproject.org/singularity/cyvcf2%3A0.31.1--py312h68a07e8_1'
+    publishDir "${params.outdir}/annotations", mode: 'copy'
+
+    input:
+    path vcf_file
+	path html
+
+    output:
+    path "annotated_variants.csv"
+
+    script:
+    """
+    python -c "
+import os
+from cyvcf2 import VCF
+
+# Input VCF file
+vcf_file = '${vcf_file}'
+output_file = 'annotated_variants.csv'
+
+# Open the VCF file
+vcf_reader = VCF(vcf_file)
+
+# Extract sample names
+samples = vcf_reader.samples
+
+# Create the output CSV
+with open(output_file, 'w') as csvfile:
+    # Write the header
+    header = ['CHROM', 'POS', 'REF', 'ALT', 'Gene', 'Impact', 'Annotation'] + samples
+    csvfile.write(','.join(header) + '\\n')
+
+    # Iterate through the VCF records
+    for record in vcf_reader:
+        chrom = record.CHROM
+        pos = record.POS
+        ref = record.REF
+        alt = ','.join(record.ALT)
+        annotations = record.INFO.get('ANN', [])
+
+        # Parse annotations if present
+        if annotations:
+            for ann in annotations.split(','):
+                fields = ann.split('|')
+                gene = fields[3]
+                impact = fields[2]
+                annotation = fields[1]
+
+                # Extract sample-specific genotype information
+                genotypes = []
+                if 'GT' in record.FORMAT:
+                    raw_genotypes = record.format('GT')
+                    for gt in raw_genotypes:
+                        # Ensure only valid genotypes are written
+                        if isinstance(gt, (bytes, str)):
+                            genotypes.append(gt.decode('utf-8') if isinstance(gt, bytes) else gt)
+                        else:
+                            genotypes.append('./.')  # Default to missing genotype
+
+                # Write the row
+                row = [chrom, pos, ref, alt, gene, impact, annotation] + genotypes
+                csvfile.write(','.join(map(str, row)) + '\\n')
+"
+
+    """
+}
+
 
 
 
@@ -521,6 +591,9 @@ workflow {
     println "Individual VCF annotation completed."
 }
 
+	
+    
+    table_creation = VCF_TO_TABLE(annotated_merged_vcf)
 	
 	
     
