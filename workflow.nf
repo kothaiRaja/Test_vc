@@ -12,6 +12,11 @@ params.scatter_count = 3
 params.mode = "test"
 params.genomedb = 'GRCh38.86'
 params.merge_vcf = false 
+params.remove_duplicates = false
+params.validation_stringency = 'STRICT'
+params.vep_cache = "/home/kothai/cq-git-sample/test/data/test/vep_cache"
+
+
 
 process SAMTOOLS_SORT_INDEX {
 	tag { sample_id }
@@ -68,11 +73,18 @@ process SAMTOOLS_FLAGSTAT {
     tuple val(sample_id), path(sorted_bam), path(bai)
 
     output:
-    tuple val(sample_id), path("${sample_id}_flagstat.txt")
+    tuple val(sample_id), path("${sample_id}_flagstat.txt"), path("${sample_id}_stats_report.txt")
 
     script:
     """
+    # Validate BAM file to ensure it is not corrupted
+    samtools quickcheck -v ${sorted_bam} || (echo "BAM file validation failed for ${sample_id}" && exit 1)
+
+    # Run samtools flagstat to generate alignment metrics
     samtools flagstat ${sorted_bam} > ${sample_id}_flagstat.txt
+
+    # Generate additional quality metrics with samtools stats
+    samtools stats ${sorted_bam} > ${sample_id}_stats_report.txt
     """
 }
 
@@ -100,8 +112,8 @@ process GATK_MARK_DUPLICATES {
         -O ${sample_id}_marked_duplicates.bam \
         -M ${sample_id}_dup_metrics.txt \
         --CREATE_INDEX true \
-		--REMOVE_DUPLICATES false \
-		--VALIDATION_STRINGENCY LENIENT
+		--REMOVE_DUPLICATES ${params.remove_duplicates ? 'true' : 'false'} \
+        --VALIDATION_STRINGENCY ${params.validation_stringency ?: 'LENIENT'}
 
     """
 }
@@ -127,6 +139,7 @@ process SPLIT_NCIGAR_READS {
         -I ${bam} \
         -O ${sample_id}_split.bam \
         --create-output-bam-index true  
+		
 	"""
 }
 
@@ -258,6 +271,10 @@ process SCATTER_INTERVAL_LIST {
     # Move the uniquely renamed files to the working directory
     mv scattered_intervals/*.interval_list .
     rm -r scattered_intervals
+	
+	# Log the generated intervals
+    echo "Scattered intervals:"
+    cat *.interval_list
     """
 }
 
@@ -294,12 +311,31 @@ process GATK_HAPLOTYPE_CALLER {
     --dont-use-soft-clipped-bases true \
     --min-base-quality-score 10 \
 	--output-mode EMIT_VARIANTS_ONLY \
-    ${intervals_args}
+    ${intervals_args} \
+    --verbosity DEBUG
 
     """
 }
 
+process BCFTOOLS_STATS {
+    tag "bcftools_stats"
 
+    container "https://depot.galaxyproject.org/singularity/bcftools%3A1.21--h8b25389_0" 
+    publishDir "${params.outdir}/bcftools_stats/beforefilteration", mode: "copy"
+
+    input:
+    tuple val(sample_id), path(vcf_file), path(vcf_index)   
+
+    output:
+    path ("haplotypecaller_stats_${sample_id}.txt")     // Output stats file
+
+    script:
+    """
+    # Generate stats
+    bcftools stats output_${sample_id}.vcf.gz > haplotypecaller_stats_${sample_id}.txt
+
+    """
+}
 
 
 process GATK_VARIANT_FILTER {
@@ -310,9 +346,9 @@ process GATK_VARIANT_FILTER {
 
     input:
     tuple val(sample_id), path(vcf_file), path(vcf_index)
-          path(genome)
-		  path(genome_index)
-		  path(genome_dict)
+    path genome
+    path genome_index
+    path genome_dict
 
     output:
     tuple val(sample_id), path("${sample_id}_filtered.vcf.gz"), path("${sample_id}_filtered.vcf.gz.tbi")
@@ -320,19 +356,53 @@ process GATK_VARIANT_FILTER {
     script:
     """
     gatk VariantFiltration \
-    -R ${genome} \
-    -V ${vcf_file} \
-    --cluster-window-size 35 --cluster-size 3 \
-    --filter-name "LowQual" --filter-expression "QUAL < 20.0" \
-	--filter-name "LowQD" --filter-expression "QD < 1.5" \
-	--filter-name "HighFS" --filter-expression "FS > 60.0" \
-	--filter-name "LowMQ" --filter-expression "MQ < 30.0" \
-	--filter-name "HighSOR" --filter-expression "SOR > 4.0" \
-	--filter-name "LowReadPosRankSum" --filter-expression "ReadPosRankSum < -5.0" \
-	--filter-name "LowBaseQRankSum" --filter-expression "BaseQRankSum < -3.0" \
-	-O ${sample_id}_filtered.vcf.gz
+        -R ${genome} \
+        -V ${vcf_file} \
+        --cluster-window-size 35 \
+        --cluster-size 3 \
+        --filter-name "LowQual" --filter-expression "QUAL < 20.0" \
+        --filter-name "LowQD" --filter-expression "QD < 1.5" \
+        --filter-name "HighFS" --filter-expression "FS > 60.0" \
+        --filter-name "LowMQ" --filter-expression "MQ < 30.0" \
+        --filter-name "HighSOR" --filter-expression "SOR > 4.0" \
+        --filter-name "LowReadPosRankSum" --filter-expression "ReadPosRankSum < -5.0" \
+        --filter-name "LowBaseQRankSum" --filter-expression "BaseQRankSum < -3.0" \
+        -O ${sample_id}_filtered.vcf.gz
+
+    # Validate the filtered VCF
+    if [ ! -s ${sample_id}_filtered.vcf.gz ]; then
+        echo "Error: Filtered VCF is empty for ${sample_id}" >&2
+        exit 1
+    fi
     """
 }
+
+
+process BCFTOOLS_QUERY {
+    tag { sample_id }
+
+    container "https://depot.galaxyproject.org/singularity/bcftools%3A1.19--h8b25389_1"
+    publishDir "${params.outdir}/variant_summary", mode: "copy"
+
+    input:
+    tuple val(sample_id), path(filtered_vcf), path(filtered_vcf_index)
+
+    output:
+    path("filtered_variants_summary_${sample_id}.txt")
+
+    script:
+    """
+    # Generate a summary of filtered variants
+    bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT\\n' ${filtered_vcf} > filtered_variants_summary_${sample_id}.txt
+
+    # Validate the output
+    if [ ! -s filtered_variants_summary_${sample_id}.txt ]; then
+        echo "Error: Summary of filtered variants is empty for ${sample_id}" >&2
+        exit 1
+    fi
+    """
+}
+
 
 process ANNOTATE_INDIVIDUAL_VARIANTS {
     tag "${sample_id}_annotate"
@@ -369,6 +439,42 @@ process ANNOTATE_INDIVIDUAL_VARIANTS {
         ${filtered_vcf} > /dev/null
     """
 }
+
+process ANNOTATE_INDIVIDUAL_VARIANTS_VEP {
+    tag "${sample_id}_vep_annotate"
+
+    container "https://depot.galaxyproject.org/singularity/ensembl-vep%3A110.1--pl5321h2a3209d_0"
+    publishDir "${params.outdir}/annotations", mode: 'copy'
+
+    input:
+    tuple val(sample_id), path(filtered_vcf), path(filtered_index)
+    path vep_cache
+
+    output:
+    tuple val(sample_id), path("${sample_id}.vep.annotated.vcf"), path("${sample_id}.vep.summary.html")
+
+    script:
+    """
+    # Annotate using Ensembl VEP
+    vep --input_file ${filtered_vcf} \
+        --output_file ${sample_id}.vep.annotated.vcf \
+        --stats_file ${sample_id}.vep.summary.html \
+        --cache \
+        --dir_cache ${vep_cache} \
+        --assembly GRCh38 \
+        --format vcf \
+        --vcf \
+        --symbol \
+        --protein
+
+    # Validate that the annotated VCF is not empty
+    if [ ! -s ${sample_id}.vep.annotated.vcf ]; then
+        echo "Error: VEP annotation output is empty for ${sample_id}" >&2
+        exit 1
+    fi
+    """
+}
+
 
 process BCFTOOLS_MERGE {
 	container "https://depot.galaxyproject.org/singularity/bcftools%3A1.19--h8b25389_1"
@@ -451,64 +557,48 @@ process VCF_TO_TABLE {
     input:
     path vcf_file
 	path html
+	path script_file
 
     output:
-    path "annotated_variants.csv"
+    path "filtered_variants.csv"
+    
 
     script:
     """
-    python -c "
-import os
-from cyvcf2 import VCF
+	
+	
+	
+	python ${script_file} ${vcf_file}
+	
+    """
+}
 
-# Input VCF file
-vcf_file = '${vcf_file}'
-output_file = 'annotated_variants.csv'
+process ANNOTATEVARIANTS_VEP {
+    container 'https://depot.galaxyproject.org/singularity/ensembl-vep%3A110.1--pl5321h2a3209d_0'
 
-# Open the VCF file
-vcf_reader = VCF(vcf_file)
+    input:
+    path "input.vcf.gz"          // Input VCF file
+    path "input.vcf.gz.tbi"      // Tabix index file for the VCF
+	path tsv
+    path "vep_cache"             // VEP cache directory
+	
 
-# Extract sample names
-samples = vcf_reader.samples
+    output:
+    path "annotated_variants.vcf"          // Annotated VCF output
+    path "annotated_variants.html"         // HTML summary report
 
-# Create the output CSV
-with open(output_file, 'w') as csvfile:
-    # Write the header
-    header = ['CHROM', 'POS', 'REF', 'ALT', 'Gene', 'Impact', 'Annotation'] + samples
-    csvfile.write(','.join(header) + '\\n')
-
-    # Iterate through the VCF records
-    for record in vcf_reader:
-        chrom = record.CHROM
-        pos = record.POS
-        ref = record.REF
-        alt = ','.join(record.ALT)
-        annotations = record.INFO.get('ANN', [])
-
-        # Parse annotations if present
-        if annotations:
-            for ann in annotations.split(','):
-                fields = ann.split('|')
-                gene = fields[3]
-                impact = fields[2]
-                annotation = fields[1]
-
-                # Extract sample-specific genotype information
-                genotypes = []
-                if 'GT' in record.FORMAT:
-                    raw_genotypes = record.format('GT')
-                    for gt in raw_genotypes:
-                        # Ensure only valid genotypes are written
-                        if isinstance(gt, (bytes, str)):
-                            genotypes.append(gt.decode('utf-8') if isinstance(gt, bytes) else gt)
-                        else:
-                            genotypes.append('./.')  # Default to missing genotype
-
-                # Write the row
-                row = [chrom, pos, ref, alt, gene, impact, annotation] + genotypes
-                csvfile.write(','.join(map(str, row)) + '\\n')
-"
-
+    script:
+    """
+    vep --input_file input.vcf.gz \
+        --output_file annotated_variants.vcf \
+        --stats_file annotated_variants.html \
+        --cache \
+        --dir_cache vep_cache \
+        --assembly GRCh38 \
+        --format vcf \
+        --vcf \
+		--symbol \
+		--protein
     """
 }
 
@@ -560,8 +650,14 @@ workflow {
 	
 	gvcf_output.view { "Raw GVCF output: $it" }
 	
+	//Step 15: provide stats
+	bcftools_stats_ch = BCFTOOLS_STATS(gvcf_output)
+	
 	// Step 1: Filter individual VCF files
 	filtered_individual_vcfs = GATK_VARIANT_FILTER(gvcf_output, params.genome, params.fasta_index, params.genome_dict)
+	
+	//Provide Stats
+	filtered_vcf_stats = BCFTOOLS_QUERY(filtered_individual_vcfs) 
 
 	// Step 2: Create a mapped collection of filtered VCF paths for merging
 	filtered_vcf = filtered_individual_vcfs
@@ -580,24 +676,29 @@ workflow {
 		// Merge filtered VCFs
 		merged_filtered_vcfs = BCFTOOLS_MERGE(filtered_vcf)
 
-    // Annotate the merged VCF file
+    // Annotate the merged VCF file snpeff
     annotated_merged_vcf = ANNOTATE_VARIANTS(merged_filtered_vcfs, snpEffJar, snpEffConfig, snpEffDbDir, params.genomedb)
+	
+	//Annotate the merged vcfs ensembl_vep
+	annotated_merged_vcf_ensemblvep = ANNOTATEVARIANTS_VEP(merged_filtered_vcfs, params.vep_cache)
 
     println "Merging and annotating VCF files completed."
+	
+	// Create a table from the annotated merged VCF
+    def vcf_to_table_script = file('convert_vcf_to_table.py') 
+    table_creation = VCF_TO_TABLE(annotated_merged_vcf, vcf_to_table_script)
+
+    println "Table creation from merged VCF completed."
+	
 	} else {
-		// Annotate individual VCF files
+    // Annotate individual VCF files
     annotated_individual_vcfs = ANNOTATE_INDIVIDUAL_VARIANTS(filtered_individual_vcfs, snpEffJar, snpEffConfig, snpEffDbDir, params.genomedb)
+	
+	//Annotate individual VCF files ensemblvep
+	annotated_individual_vcf_ensemblvep = ANNOTATE_INDIVIDUAL_VARIANTS_VEP (filtered_individual_vcfs, params.vep_cache)
 
     println "Individual VCF annotation completed."
+    println "Table creation step skipped because merging is disabled."
 }
-
-	
-    
-    table_creation = VCF_TO_TABLE(annotated_merged_vcf)
-	
-	
-    
-	
-	
 
 }
