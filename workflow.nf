@@ -15,6 +15,8 @@ params.merge_vcf = false
 params.remove_duplicates = false
 params.validation_stringency = 'STRICT'
 params.vep_cache = "/home/kothai/cq-git-sample/test/data/test/vep_cache"
+params.clinvar = "/home/kothai/cq-git-sample/test/data/test/clinvar/clinvar.vcf.gz"
+params.clinvartbi = "/home/kothai/cq-git-sample/test/data/test/clinvar/clinvar.vcf.gz.tbi"
 
 
 
@@ -321,13 +323,13 @@ process BCFTOOLS_STATS {
     tag "bcftools_stats"
 
     container "https://depot.galaxyproject.org/singularity/bcftools%3A1.21--h8b25389_0" 
-    publishDir "${params.outdir}/bcftools_stats/beforefilteration", mode: "copy"
+    publishDir "${params.outdir}/bcftools_stats", mode: "copy"
 
     input:
     tuple val(sample_id), path(vcf_file), path(vcf_index)   
 
     output:
-    path ("haplotypecaller_stats_${sample_id}.txt")     // Output stats file
+    tuple val(sample_id), path("haplotypecaller_stats_${sample_id}.txt")   
 
     script:
     """
@@ -388,7 +390,7 @@ process BCFTOOLS_QUERY {
     tuple val(sample_id), path(filtered_vcf), path(filtered_vcf_index)
 
     output:
-    path("filtered_variants_summary_${sample_id}.txt")
+    tuple val(sample_id), path("filtered_variants_summary_${sample_id}.txt")
 
     script:
     """
@@ -447,15 +449,17 @@ process ANNOTATE_INDIVIDUAL_VARIANTS_VEP {
     publishDir "${params.outdir}/annotations", mode: 'copy'
 
     input:
-    tuple val(sample_id), path(filtered_vcf), path(filtered_index)
-    path vep_cache
+    tuple val(sample_id), path(filtered_vcf), path(filtered_index)  // Input VCF and its index
+    path vep_cache                                                  // VEP cache directory
+    path clinvar_vcf                                                // ClinVar VCF file
+    path clinvar_index                                              // ClinVar Tabix index file
 
     output:
     tuple val(sample_id), path("${sample_id}.vep.annotated.vcf"), path("${sample_id}.vep.summary.html")
 
     script:
     """
-    # Annotate using Ensembl VEP
+    # Annotate using Ensembl VEP with ClinVar
     vep --input_file ${filtered_vcf} \
         --output_file ${sample_id}.vep.annotated.vcf \
         --stats_file ${sample_id}.vep.summary.html \
@@ -465,7 +469,9 @@ process ANNOTATE_INDIVIDUAL_VARIANTS_VEP {
         --format vcf \
         --vcf \
         --symbol \
-        --protein
+        --protein \
+        --force_overwrite \
+        --custom ${clinvar_vcf},ClinVar,vcf,exact,0,CLNSIG,CLNDN
 
     # Validate that the annotated VCF is not empty
     if [ ! -s ${sample_id}.vep.annotated.vcf ]; then
@@ -575,13 +581,14 @@ process VCF_TO_TABLE {
 
 process ANNOTATEVARIANTS_VEP {
     container 'https://depot.galaxyproject.org/singularity/ensembl-vep%3A110.1--pl5321h2a3209d_0'
-
+	publishDir "${params.outdir}/annotations", mode: 'copy'
     input:
     path "input.vcf.gz"          // Input VCF file
     path "input.vcf.gz.tbi"      // Tabix index file for the VCF
 	path tsv
     path "vep_cache"             // VEP cache directory
-	
+    path "clinvar.vcf.gz"        // ClinVar VCF file
+    path "clinvar.vcf.gz.tbi"    // Tabix index file for ClinVar
 
     output:
     path "annotated_variants.vcf"          // Annotated VCF output
@@ -597,11 +604,31 @@ process ANNOTATEVARIANTS_VEP {
         --assembly GRCh38 \
         --format vcf \
         --vcf \
-		--symbol \
-		--protein
+        --symbol \
+        --protein \
+        --force_overwrite \
+        --custom clinvar.vcf.gz,ClinVar,vcf,exact,0,CLNSIG,CLNDN
     """
 }
 
+
+process MULTIQC_REPORT {
+    tag "MultiQC"
+	container "https://depot.galaxyproject.org/singularity/multiqc%3A1.26--pyhdfd78af_0"
+    publishDir "${params.outdir}/multiqc", mode: 'copy'
+
+    input:
+    path qc_report_files 
+
+    output:
+    path "multiqc_report.html"
+    path "multiqc_data"
+
+    script:
+    """
+    multiqc ${qc_report_files.join(' ')} -o .
+    """
+}
 
 
 
@@ -680,7 +707,7 @@ workflow {
     annotated_merged_vcf = ANNOTATE_VARIANTS(merged_filtered_vcfs, snpEffJar, snpEffConfig, snpEffDbDir, params.genomedb)
 	
 	//Annotate the merged vcfs ensembl_vep
-	annotated_merged_vcf_ensemblvep = ANNOTATEVARIANTS_VEP(merged_filtered_vcfs, params.vep_cache)
+	annotated_merged_vcf_ensemblvep = ANNOTATEVARIANTS_VEP(merged_filtered_vcfs, params.vep_cache, params.clinvar, params.clinvartbi)
 
     println "Merging and annotating VCF files completed."
 	
@@ -691,14 +718,30 @@ workflow {
     println "Table creation from merged VCF completed."
 	
 	} else {
-    // Annotate individual VCF files
+    
+	// Annotate individual VCF files
     annotated_individual_vcfs = ANNOTATE_INDIVIDUAL_VARIANTS(filtered_individual_vcfs, snpEffJar, snpEffConfig, snpEffDbDir, params.genomedb)
 	
 	//Annotate individual VCF files ensemblvep
-	annotated_individual_vcf_ensemblvep = ANNOTATE_INDIVIDUAL_VARIANTS_VEP (filtered_individual_vcfs, params.vep_cache)
+	annotated_individual_vcf_ensemblvep = ANNOTATE_INDIVIDUAL_VARIANTS_VEP (filtered_individual_vcfs, params.vep_cache, params.clinvar, params.clinvartbi)
 
     println "Individual VCF annotation completed."
     println "Table creation step skipped because merging is disabled."
 }
+	qc_outputs_ch = alignment_stats
+    .map { it[1] } // Extract path from tuple
+    .mix(
+        bcftools_stats_ch.map { it[1] }, // Extract path
+        filtered_vcf_stats.map { it[1] } // Extract path
+    )
+    .collect()
+
+
+	multiqc_results = MULTIQC_REPORT(qc_outputs_ch)
+
+	
+	
+	
+	
 
 }
